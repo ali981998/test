@@ -1,0 +1,113 @@
+name: Steam Game Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_appid:
+        description: 'Steam App ID'
+        required: true
+        default: '1872800'
+      upload_mode:
+        description: 'Upload destination'
+        required: true
+        default: 'repository'
+        type: choice
+        options:
+          - repository
+          - artifact
+
+jobs:
+  download:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download SteamCMD
+        run: |
+          Invoke-WebRequest -Uri "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip" -OutFile "steamcmd.zip"
+          Expand-Archive -Path "steamcmd.zip" -DestinationPath "steamcmd" -Force
+        shell: powershell
+
+      - name: Download Game
+        env:
+          STEAM_USERNAME: ${{ secrets.STEAM_USERNAME }}
+          STEAM_PASSWORD: ${{ secrets.STEAM_PASSWORD }}
+        run: |
+          New-Item -Path "downloads/Game" -ItemType Directory -Force
+          
+          cd steamcmd
+          
+          @"
+          @ShutdownOnFailedCommand 1
+          @NoPromptForPassword 1
+          force_install_dir ../game_download
+          login $env:STEAM_USERNAME $env:STEAM_PASSWORD
+          app_update ${{ inputs.game_appid }} validate
+          quit
+          "@ | Out-File -Encoding ASCII "download.txt"
+          
+          Write-Host "Downloading game..."
+          .\steamcmd.exe +runscript download.txt
+          
+          Write-Host "Copying game files..."
+          $source = "../game_download"
+          
+          if (Test-Path "$source/steamapps/common") {
+            Copy-Item -Recurse "$source/steamapps/common/*" -Destination "../downloads/Game/" -Force -ErrorAction SilentlyContinue
+          } else {
+            Copy-Item -Recurse "$source/*" -Destination "../downloads/Game/" -Force -ErrorAction SilentlyContinue
+          }
+          
+          $manifest = Get-ChildItem "$source/steamapps" -Filter "appmanifest_*.acf" | Select-Object -First 1
+          if ($manifest) {
+            Copy-Item $manifest.FullName -Destination "../downloads/Game/appmanifest_${{ inputs.game_appid }}.acf" -Force
+            Write-Host "appmanifest.acf copied"
+          }
+        shell: powershell
+        continue-on-error: true
+
+      - name: Compress Files
+        run: |
+          if (Test-Path "downloads/Game") {
+            Remove-Item "downloads/Game/Game.part*" -Force -ErrorAction SilentlyContinue
+            Remove-Item "downloads/Game/Game.zip" -Force -ErrorAction SilentlyContinue
+            
+            $totalSizeGB = (Get-ChildItem "downloads/Game" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB
+            Write-Host "Total game size: $totalSizeGB GB"
+            
+            if ("${{ inputs.upload_mode }}" -eq "repository" -or $totalSizeGB -gt 8) {
+              Write-Host "Compressing with 4GB parts..."
+              & "C:\Program Files\7-Zip\7z.exe" a -v4096m -mx3 "downloads/Game/Game.part" "downloads/Game/*"
+            } else {
+              Write-Host "Compressing as single file..."
+              & "C:\Program Files\7-Zip\7z.exe" a -mx3 "downloads/Game/Game.zip" "downloads/Game/*"
+            }
+          }
+        shell: powershell
+
+      - name: Upload to Repository
+        if: ${{ inputs.upload_mode == 'repository' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          $parts = Get-ChildItem "downloads/Game" -Filter "*.part*" -ErrorAction SilentlyContinue
+          if ($parts.Count -gt 0) {
+            git add $parts.FullName
+            git commit -m "Add game parts (AppID ${{ inputs.game_appid }})" --allow-empty
+            git push
+            Write-Host "Successfully pushed to repository"
+          }
+        shell: powershell
+
+      - name: Upload as Artifact
+        if: ${{ inputs.upload_mode == 'artifact' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Game-${{ inputs.game_appid }}
+          path: downloads/Game/
+          retention-days: 7
